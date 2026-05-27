@@ -15,7 +15,7 @@ const PORT = Number(process.env.PORT) || 8787;
 const API_ID = process.env.SMSRU_API_ID;
 const APP_SECRET = process.env.APP_SECRET || "";
 const IS_PROD = process.env.NODE_ENV === "production";
-const SMSRU_MIN_AHEAD_SEC = 600;
+const SMSRU_MIN_AHEAD_SEC = 5;
 
 app.use(express.json({ limit: "16kb" }));
 app.use((_req, res, next) => {
@@ -52,18 +52,46 @@ async function smsRuRequest(path, params) {
   return res.json();
 }
 
-function extractSmsId(data, phone) {
-  const block = data?.sms?.[phone];
-  if (!block?.sms_id) return null;
+function getSmsBlock(data, phone) {
+  if (!data?.sms || typeof data.sms !== "object") return null;
+  if (data.sms[phone]) return data.sms[phone];
+  const digits = String(phone).replace(/\D/g, "");
+  for (const [key, block] of Object.entries(data.sms)) {
+    if (String(key).replace(/\D/g, "") === digits) return block;
+  }
+  const keys = Object.keys(data.sms);
+  return keys.length === 1 ? data.sms[keys[0]] : null;
+}
+
+function smsRuError(data, fallback) {
+  if (data?.status !== "OK") {
+    const code = data?.status_code ? ` (код ${data.status_code})` : "";
+    return (data?.status_text || fallback) + code;
+  }
+  return fallback;
+}
+
+function parseSmsRuSendResponse(data, phone, fallback) {
+  if (data?.status !== "OK") {
+    throw new Error(smsRuError(data, fallback));
+  }
+  const block = getSmsBlock(data, phone);
+  if (!block) {
+    throw new Error("SMS.ru не вернул статус для номера");
+  }
+  if (block.status === "ERROR") {
+    const code = block.status_code ? ` (код ${block.status_code})` : "";
+    throw new Error((block.status_text || "SMS.ru отклонил номер") + code);
+  }
+  if (!block.sms_id) {
+    throw new Error("Не получен sms_id от SMS.ru");
+  }
   return String(block.sms_id);
 }
 
 async function sendSmsNow(phone, message) {
   const data = await smsRuRequest("sms/send", { to: phone, msg: message });
-  if (data.status !== "OK") {
-    throw new Error(data.status_text || "SMS.ru отклонил отправку");
-  }
-  return extractSmsId(data, phone);
+  return parseSmsRuSendResponse(data, phone, "SMS.ru отклонил отправку");
 }
 
 async function scheduleSmsRu(phone, message, endTime) {
@@ -72,12 +100,7 @@ async function scheduleSmsRu(phone, message, endTime) {
     msg: message,
     time: String(Math.floor(endTime / 1000)),
   });
-  if (data.status !== "OK") {
-    throw new Error(data.status_text || "SMS.ru отклонил планирование");
-  }
-  const smsId = extractSmsId(data, phone);
-  if (!smsId) throw new Error("Не получен sms_id от SMS.ru");
-  return smsId;
+  return parseSmsRuSendResponse(data, phone, "SMS.ru отклонил планирование");
 }
 
 async function processDueJobs() {
@@ -212,12 +235,13 @@ app.post("/api/sms/test", async (req, res) => {
   }
 
   try {
-    await sendSmsNow(
+    const smsId = await sendSmsNow(
       phone,
       "Life Map: тестовое SMS. Если вы его получили — глобальный сервер работает."
     );
-    res.json({ ok: true });
+    res.json({ ok: true, smsId, phone });
   } catch (err) {
+    console.error("[test]", phone, err.message);
     res.status(502).json({ ok: false, error: err.message || "Ошибка SMS.ru" });
   }
 });
